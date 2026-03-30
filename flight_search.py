@@ -43,7 +43,7 @@ class Config:
     # Search behavior
     max_outbound_cards_to_try: int = 3
     max_return_cards_to_try: int = 3
-    max_total_attempts_per_combo: int = 1
+    max_total_attempts_per_combo: int = 3
 
     headless: bool = False
     slow_mo_ms: int = 0
