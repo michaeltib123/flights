@@ -193,11 +193,22 @@ def time_ok_for_departure(t: Optional[dtime]) -> bool:
 def arrival_is_valid(depart_t: Optional[dtime], arrive_t: Optional[dtime]) -> bool:
     if depart_t is None or arrive_t is None:
         return False
-    if arrive_t < depart_t:
-        return False
+    # Overnight arrivals are allowed unless a latest-arrival cutoff is configured.
     if CONFIG.latest_arrival_time is None:
         return True
-    return arrive_t <= CONFIG.latest_arrival_time
+
+    depart_mins = depart_t.hour * 60 + depart_t.minute
+    arrive_mins = arrive_t.hour * 60 + arrive_t.minute
+    latest_mins = (
+        CONFIG.latest_arrival_time.hour * 60
+        + CONFIG.latest_arrival_time.minute
+    )
+
+    # Normalize overnight arrivals to next day before cutoff comparison.
+    if arrive_mins < depart_mins:
+        arrive_mins += 24 * 60
+
+    return arrive_mins <= latest_mins
 
 
 def daterange(start: date, end: date):
@@ -268,13 +279,16 @@ def wait_for_page_ready(page: Page):
 
 
 def wait_for_results_ready(page: Page):
-    # Wait for likely results containers/cards so searches/card transitions settle faster.
+    # Intentionally conservative: avoid stale-content transitions after result changes.
     try:
         page.locator("[role='main']").first.wait_for(state="visible", timeout=7000)
         cards = page.locator("[role='main'] [role='listitem'], [role='main'] li, main [role='listitem'], main li")
-        cards.first.wait_for(state="visible", timeout=5000)
+        cards.first.wait_for(state="visible", timeout=7000)
+        # Conservative settle so transitions/pricing complete before moving on.
+        wait_for_settle(page, 1500)
     except Exception:
-        wait_for_settle(page, 500)
+        # Keep a substantial fallback wait for reliability when selectors are unstable.
+        wait_for_settle(page, 1700)
 
 
 def wait_for_dialog_to_close(page: Page):
@@ -720,6 +734,7 @@ def close_date_picker(page: Page):
         try:
             page.keyboard.press("Escape")
             wait_for_dialog_to_close(page)
+            wait_for_settle(page, 700)
         except Exception:
             pass
 
@@ -729,6 +744,7 @@ def close_date_picker(page: Page):
             btn = page.get_by_role("button", name=re.compile(rf"^{label}$", re.I))
             if btn.count() > 0 and try_click(btn.first, 1000):
                 wait_for_dialog_to_close(page)
+                wait_for_settle(page, 700)
                 return
         except Exception:
             pass
@@ -758,6 +774,8 @@ def set_dates(page: Page, depart: date, ret: date):
         wait_for_settle(page, 600)
     close_date_picker(page)
     wait_for_dialog_to_close(page)
+    # Intentionally conservative after closing picker to avoid stale date state.
+    wait_for_settle(page, 1300)
 
 
 def click_search_or_refresh(page: Page):
@@ -1019,11 +1037,13 @@ def back_one(page: Page):
         page.go_back(wait_until="domcontentloaded")
         wait_for_page_ready(page)
         wait_for_results_ready(page)
+        wait_for_settle(page, 700)
     except Exception:
         try:
             page.keyboard.press("Alt+Left")
             wait_for_page_ready(page)
             wait_for_results_ready(page)
+            wait_for_settle(page, 700)
         except Exception:
             pass
 
@@ -1089,6 +1109,8 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
             continue
 
         wait_for_results_ready(page)
+        # Conservative transition wait: return list can lag behind initial click completion.
+        wait_for_settle(page, 1300)
 
         # Phase 2: return results
         return_cards = collect_flight_cards(page, "return", CONFIG.max_return_cards_to_try)
@@ -1107,6 +1129,8 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
                 continue
 
             wait_for_results_ready(page)
+            # Conservative transition wait: total pricing often lands after card selection.
+            wait_for_settle(page, 1300)
             total_value, total_text = extract_total_price_from_page(page)
 
             current = RoundTripResult(
