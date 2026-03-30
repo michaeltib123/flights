@@ -5,7 +5,7 @@ import json
 import time
 import shutil
 import traceback
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import date, datetime, timedelta, time as dtime
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
@@ -33,8 +33,12 @@ class Config:
     min_trip_days: int = 6
     max_trip_days: int = 8
 
-    earliest_departure_time: dtime = dtime(7, 0)   # no earlier than 7:00 AM
-    latest_arrival_time: dtime = dtime(22, 0)      # no later than 10:00 PM
+    passengers: int = 1
+    round_trip: bool = True
+    allowed_airlines: List[str] = field(default_factory=list)
+
+    earliest_departure_time: Optional[dtime] = dtime(7, 0)   # None means no restriction
+    latest_arrival_time: Optional[dtime] = dtime(22, 0)      # None means no restriction
 
     # Search behavior
     max_outbound_cards_to_try: int = 8
@@ -179,11 +183,21 @@ def parse_time_token(token: str) -> Optional[dtime]:
 
 
 def time_ok_for_departure(t: Optional[dtime]) -> bool:
-    return t is not None and t >= CONFIG.earliest_departure_time
+    if t is None:
+        return False
+    if CONFIG.earliest_departure_time is None:
+        return True
+    return t >= CONFIG.earliest_departure_time
 
 
-def time_ok_for_arrival(t: Optional[dtime]) -> bool:
-    return t is not None and t <= CONFIG.latest_arrival_time
+def arrival_is_valid(depart_t: Optional[dtime], arrive_t: Optional[dtime]) -> bool:
+    if depart_t is None or arrive_t is None:
+        return False
+    if arrive_t < depart_t:
+        return False
+    if CONFIG.latest_arrival_time is None:
+        return True
+    return arrive_t <= CONFIG.latest_arrival_time
 
 
 def daterange(start: date, end: date):
@@ -444,47 +458,132 @@ def set_origin_destination(page: Page, origin: str, destination: str):
     screenshot(page, f"route_set_{origin}_{destination}")
 
 
-def ensure_round_trip(page: Page):
-    # Try to set trip mode to Round trip.
-    # Often visible as a button or combo.
-    log("[step] ensuring round trip mode")
-    patterns = [
-        re.compile(r"Round trip", re.I),
-        re.compile(r"Trip type", re.I),
-    ]
+def ensure_trip_mode(page: Page, round_trip: bool = True):
+    target_label = "Round trip" if round_trip else "One way"
+    log(f"[step] ensuring trip mode: {target_label}")
 
-    # If already says round trip somewhere visible, leave it.
+    # If target mode is already clearly visible, assume it's set.
     try:
-        rt = page.get_by_text(re.compile(r"Round trip", re.I))
-        if rt.count() > 0:
+        current = first_visible(page.get_by_text(re.compile(rf"^{re.escape(target_label)}$", re.I)))
+        if current is not None:
             return
     except Exception:
         pass
 
-    for pat in patterns:
-        try:
-            btn = page.get_by_role("button", name=pat)
-            vis = first_visible(btn)
-            if vis:
-                if try_click(vis, 2000):
-                    wait_for_settle(page, 600)
-                    try:
-                        choice = page.get_by_role("option", name=re.compile(r"Round trip", re.I))
-                        if choice.count() > 0 and try_click(choice.first, 2000):
-                            wait_for_settle(page, 800)
-                            return
-                    except Exception:
-                        pass
+    opener_candidates = [
+        page.get_by_role("button", name=re.compile(r"Trip type", re.I)),
+        page.get_by_role("button", name=re.compile(r"Round trip|One way", re.I)),
+        page.get_by_text(re.compile(r"Round trip|One way", re.I)),
+    ]
 
-                    try:
-                        choice = page.get_by_text(re.compile(r"Round trip", re.I))
-                        if choice.count() > 0 and try_click(choice.first, 2000):
-                            wait_for_settle(page, 800)
-                            return
-                    except Exception:
-                        pass
+    opened = False
+    for cand in opener_candidates:
+        vis = first_visible(cand)
+        if vis and try_click(vis, 2000):
+            wait_for_settle(page, 500)
+            opened = True
+            break
+
+    if not opened:
+        return
+
+    choice_candidates = [
+        page.get_by_role("option", name=re.compile(rf"^{re.escape(target_label)}$", re.I)),
+        page.get_by_role("menuitem", name=re.compile(rf"^{re.escape(target_label)}$", re.I)),
+        page.get_by_text(re.compile(rf"^{re.escape(target_label)}$", re.I)),
+    ]
+    for choice in choice_candidates:
+        vis = first_visible(choice)
+        if vis and try_click(vis, 2000):
+            wait_for_settle(page, 800)
+            return
+
+
+def set_passengers(page: Page, adults: int = 1):
+    adults = max(1, int(adults))
+    log(f"[step] setting passengers (adults={adults})")
+
+    opener_candidates = [
+        page.get_by_role("button", name=re.compile(r"Passengers|Adults|Traveler", re.I)),
+        page.get_by_text(re.compile(r"Passengers|Adults|Traveler", re.I)),
+    ]
+
+    opened = False
+    for cand in opener_candidates:
+        vis = first_visible(cand)
+        if vis and try_click(vis, 2500):
+            wait_for_settle(page, 600)
+            opened = True
+            break
+
+    if not opened:
+        log("[warn] passenger selector could not be opened")
+        return
+
+    body_text = safe_inner_text(page.locator("body"))
+    current = None
+    m = re.search(r"Adults?\D+(\d+)", body_text, re.I)
+    if m:
+        current = int(m.group(1))
+    else:
+        m = re.search(r"\b(\d+)\s+adults?\b", body_text, re.I)
+        if m:
+            current = int(m.group(1))
+
+    if current is None:
+        log("[warn] could not confidently detect current adult count; leaving unchanged")
+        close_date_picker(page)
+        return
+
+    inc_candidates = [
+        page.get_by_role("button", name=re.compile(r"(Increase|Add).*(Adult|Passenger|Traveler)", re.I)),
+        page.get_by_role("button", name=re.compile(r"plus", re.I)),
+    ]
+    dec_candidates = [
+        page.get_by_role("button", name=re.compile(r"(Decrease|Remove).*(Adult|Passenger|Traveler)", re.I)),
+        page.get_by_role("button", name=re.compile(r"minus", re.I)),
+    ]
+
+    while current < adults:
+        btn = None
+        for cand in inc_candidates:
+            vis = first_visible(cand)
+            if vis is not None:
+                btn = vis
+                break
+        if btn is None or not try_click(btn, 1500):
+            log("[warn] could not increase passengers to requested value")
+            break
+        current += 1
+        wait_for_settle(page, 250)
+
+    while current > adults:
+        btn = None
+        for cand in dec_candidates:
+            vis = first_visible(cand)
+            if vis is not None:
+                btn = vis
+                break
+        if btn is None or not try_click(btn, 1500):
+            log("[warn] could not decrease passengers to requested value")
+            break
+        current -= 1
+        wait_for_settle(page, 250)
+
+    # Best-effort close.
+    for label in ["Done", "Apply", "OK"]:
+        try:
+            btn = page.get_by_role("button", name=re.compile(rf"^{label}$", re.I))
+            vis = first_visible(btn)
+            if vis and try_click(vis, 1200):
+                wait_for_settle(page, 400)
+                return
         except Exception:
             pass
+    try:
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
 
 
 def open_date_picker(page: Page):
@@ -621,14 +720,15 @@ def set_dates(page: Page, depart: date, ret: date):
 
     wait_for_settle(page, 500)
 
-    # Navigate toward return month
-    go_to_month_in_date_picker(page, ret)
-    if not click_calendar_day(page, ret):
-        screenshot(page, f"return_click_failed_{ret}")
-        dump_html(page, f"return_click_failed_{ret}")
-        raise RuntimeError(f"Could not click return date {ret}.")
+    if CONFIG.round_trip:
+        # Navigate toward return month
+        go_to_month_in_date_picker(page, ret)
+        if not click_calendar_day(page, ret):
+            screenshot(page, f"return_click_failed_{ret}")
+            dump_html(page, f"return_click_failed_{ret}")
+            raise RuntimeError(f"Could not click return date {ret}.")
 
-    wait_for_settle(page, 600)
+        wait_for_settle(page, 600)
     close_date_picker(page)
     wait_for_settle(page, 1200)
 
@@ -802,6 +902,7 @@ def outbound_card_allowed(card: FlightCard) -> bool:
     return (
         time_ok_for_departure(card.depart_time)
         and arrival_is_valid(card.depart_time, card.arrive_time)
+        and airline_allowed(card)
     )
 
 
@@ -809,19 +910,17 @@ def return_card_allowed(card: FlightCard) -> bool:
     return (
         time_ok_for_departure(card.depart_time)
         and arrival_is_valid(card.depart_time, card.arrive_time)
+        and airline_allowed(card)
     )
 
 
-def arrival_is_valid(depart_t: Optional[dtime], arrive_t: Optional[dtime]) -> bool:
-    if depart_t is None or arrive_t is None:
+def airline_allowed(card: FlightCard) -> bool:
+    if not CONFIG.allowed_airlines:
+        return True
+    if not card.airline_text:
         return False
-
-    # If arrival is earlier than departure → it's next day → reject
-    if arrive_t < depart_t:
-        return False
-
-    # Normal same-day check
-    return arrive_t <= CONFIG.latest_arrival_time
+    hay = card.airline_text.lower()
+    return any(needle.lower() in hay for needle in CONFIG.allowed_airlines)
 
 def click_card_by_text(page: Page, raw_text: str) -> bool:
     """
@@ -1044,6 +1143,53 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
     )
 
 
+def search_one_way_best(page: Page, depart: date) -> RoundTripResult:
+    set_dates(page, depart, depart)
+    click_search_or_refresh(page)
+
+    log("[step] collecting one-way outbound cards")
+    outbound_cards = collect_flight_cards(page, "outbound", CONFIG.max_outbound_cards_to_try)
+    outbound_cards = [c for c in outbound_cards if outbound_card_allowed(c)]
+
+    if not outbound_cards:
+        return RoundTripResult(
+            depart_date=depart.isoformat(),
+            return_date="",
+            trip_days=0,
+            total_price=None,
+            total_price_text=None,
+            outbound_airline=None,
+            outbound_depart=None,
+            outbound_arrive=None,
+            outbound_stops=None,
+            return_airline=None,
+            return_depart=None,
+            return_arrive=None,
+            return_stops=None,
+            notes="No valid one-way outbound cards found",
+            success=False,
+        )
+
+    best = outbound_cards[0]
+    return RoundTripResult(
+        depart_date=depart.isoformat(),
+        return_date="",
+        trip_days=0,
+        total_price=best.price_value,
+        total_price_text=best.price_text,
+        outbound_airline=best.airline_text,
+        outbound_depart=best.depart_time_text,
+        outbound_arrive=best.arrive_time_text,
+        outbound_stops=best.stops_text,
+        return_airline=None,
+        return_depart=None,
+        return_arrive=None,
+        return_stops=None,
+        notes="OK",
+        success=best.price_value is not None,
+    )
+
+
 def summarize_best_by_depart_date(results: List[RoundTripResult]) -> pd.DataFrame:
     df = pd.DataFrame([asdict(r) for r in results])
 
@@ -1138,55 +1284,54 @@ def main():
 
         try:
             open_google_flights(page)
-            ensure_round_trip(page)
+            ensure_trip_mode(page, CONFIG.round_trip)
             set_origin_destination(page, CONFIG.origin, CONFIG.destination)
+            set_passengers(page, CONFIG.passengers)
 
             # Main sweep
             for depart in daterange(CONFIG.start_date, CONFIG.end_date):
                 best_for_depart: Optional[RoundTripResult] = None
 
-                for trip_days in range(CONFIG.min_trip_days, CONFIG.max_trip_days + 1):
-                    ret = depart + timedelta(days=trip_days)
-
-                    # Skip combos where return goes absurdly beyond desired horizon only if you want.
-                    # Here we allow it.
+                if not CONFIG.round_trip:
                     combo_result = None
                     for attempt in range(1, CONFIG.max_total_attempts_per_combo + 1):
                         log(
-                            f"\n=== {depart.isoformat()} + {trip_days}d "
+                            f"\n=== one-way {depart.isoformat()} "
                             f"(attempt {attempt}/{CONFIG.max_total_attempts_per_combo}) ==="
                         )
                         try:
-                            combo_result = search_combo_and_pick_best(page, depart, ret)
+                            combo_result = search_one_way_best(page, depart)
                             break
                         except PlaywrightTimeoutError:
-                            log("[warn] Playwright timeout; retrying combo")
-                            screenshot(page, f"timeout_{depart}_{ret}_attempt{attempt}")
-                            dump_html(page, f"timeout_{depart}_{ret}_attempt{attempt}")
+                            log("[warn] Playwright timeout; retrying one-way search")
+                            screenshot(page, f"timeout_oneway_{depart}_attempt{attempt}")
+                            dump_html(page, f"timeout_oneway_{depart}_attempt{attempt}")
                             try:
                                 page.goto(URL, wait_until="domcontentloaded")
                                 wait_for_settle(page, 2500)
-                                ensure_round_trip(page)
+                                ensure_trip_mode(page, CONFIG.round_trip)
                                 set_origin_destination(page, CONFIG.origin, CONFIG.destination)
+                                set_passengers(page, CONFIG.passengers)
                             except Exception:
                                 pass
                         except Exception as e:
-                            log(f"[warn] combo failed: {e}")
-                            screenshot(page, f"combo_error_{depart}_{ret}_attempt{attempt}")
-                            dump_html(page, f"combo_error_{depart}_{ret}_attempt{attempt}")
+                            log(f"[warn] one-way combo failed: {e}")
+                            screenshot(page, f"combo_error_oneway_{depart}_attempt{attempt}")
+                            dump_html(page, f"combo_error_oneway_{depart}_attempt{attempt}")
                             try:
                                 page.goto(URL, wait_until="domcontentloaded")
                                 wait_for_settle(page, 2500)
-                                ensure_round_trip(page)
+                                ensure_trip_mode(page, CONFIG.round_trip)
                                 set_origin_destination(page, CONFIG.origin, CONFIG.destination)
+                                set_passengers(page, CONFIG.passengers)
                             except Exception:
                                 pass
 
                     if combo_result is None:
                         combo_result = RoundTripResult(
                             depart_date=depart.isoformat(),
-                            return_date=ret.isoformat(),
-                            trip_days=trip_days,
+                            return_date="",
+                            trip_days=0,
                             total_price=None,
                             total_price_text=None,
                             outbound_airline=None,
@@ -1197,23 +1342,86 @@ def main():
                             return_depart=None,
                             return_arrive=None,
                             return_stops=None,
-                            notes="Combo failed after retries",
+                            notes="One-way combo failed after retries",
                             success=False,
                         )
 
                     all_results.append(combo_result)
                     append_to_excel(combo_result)
-
                     if combo_result.success:
-                        if (
-                            best_for_depart is None
-                            or (
-                                combo_result.total_price is not None
-                                and best_for_depart.total_price is not None
-                                and combo_result.total_price < best_for_depart.total_price
+                        best_for_depart = combo_result
+                else:
+                    for trip_days in range(CONFIG.min_trip_days, CONFIG.max_trip_days + 1):
+                        ret = depart + timedelta(days=trip_days)
+
+                        # Skip combos where return goes absurdly beyond desired horizon only if you want.
+                        # Here we allow it.
+                        combo_result = None
+                        for attempt in range(1, CONFIG.max_total_attempts_per_combo + 1):
+                            log(
+                                f"\n=== {depart.isoformat()} + {trip_days}d "
+                                f"(attempt {attempt}/{CONFIG.max_total_attempts_per_combo}) ==="
                             )
-                        ):
-                            best_for_depart = combo_result
+                            try:
+                                combo_result = search_combo_and_pick_best(page, depart, ret)
+                                break
+                            except PlaywrightTimeoutError:
+                                log("[warn] Playwright timeout; retrying combo")
+                                screenshot(page, f"timeout_{depart}_{ret}_attempt{attempt}")
+                                dump_html(page, f"timeout_{depart}_{ret}_attempt{attempt}")
+                                try:
+                                    page.goto(URL, wait_until="domcontentloaded")
+                                    wait_for_settle(page, 2500)
+                                    ensure_trip_mode(page, CONFIG.round_trip)
+                                    set_origin_destination(page, CONFIG.origin, CONFIG.destination)
+                                    set_passengers(page, CONFIG.passengers)
+                                except Exception:
+                                    pass
+                            except Exception as e:
+                                log(f"[warn] combo failed: {e}")
+                                screenshot(page, f"combo_error_{depart}_{ret}_attempt{attempt}")
+                                dump_html(page, f"combo_error_{depart}_{ret}_attempt{attempt}")
+                                try:
+                                    page.goto(URL, wait_until="domcontentloaded")
+                                    wait_for_settle(page, 2500)
+                                    ensure_trip_mode(page, CONFIG.round_trip)
+                                    set_origin_destination(page, CONFIG.origin, CONFIG.destination)
+                                    set_passengers(page, CONFIG.passengers)
+                                except Exception:
+                                    pass
+
+                        if combo_result is None:
+                            combo_result = RoundTripResult(
+                                depart_date=depart.isoformat(),
+                                return_date=ret.isoformat(),
+                                trip_days=trip_days,
+                                total_price=None,
+                                total_price_text=None,
+                                outbound_airline=None,
+                                outbound_depart=None,
+                                outbound_arrive=None,
+                                outbound_stops=None,
+                                return_airline=None,
+                                return_depart=None,
+                                return_arrive=None,
+                                return_stops=None,
+                                notes="Combo failed after retries",
+                                success=False,
+                            )
+
+                        all_results.append(combo_result)
+                        append_to_excel(combo_result)
+
+                        if combo_result.success:
+                            if (
+                                best_for_depart is None
+                                or (
+                                    combo_result.total_price is not None
+                                    and best_for_depart.total_price is not None
+                                    and combo_result.total_price < best_for_depart.total_price
+                                )
+                            ):
+                                best_for_depart = combo_result
 
                 if best_for_depart:
                     log(
