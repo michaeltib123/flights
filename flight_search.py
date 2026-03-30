@@ -41,12 +41,12 @@ class Config:
     latest_arrival_time: Optional[dtime] = dtime(22, 0)      # None means no restriction
 
     # Search behavior
-    max_outbound_cards_to_try: int = 8
-    max_return_cards_to_try: int = 8
-    max_total_attempts_per_combo: int = 2
+    max_outbound_cards_to_try: int = 3
+    max_return_cards_to_try: int = 3
+    max_total_attempts_per_combo: int = 1
 
     headless: bool = False
-    slow_mo_ms: int = 80
+    slow_mo_ms: int = 0
     page_timeout_ms: int = 25000
 
     # Persisted Chrome-ish profile for cookies / consent / session
@@ -258,6 +258,33 @@ def wait_for_settle(page: Page, ms: int = 1200):
     page.wait_for_timeout(ms)
 
 
+def wait_for_page_ready(page: Page):
+    # Prefer DOM/event readiness over fixed sleep after navigation.
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=9000)
+        page.locator("body").first.wait_for(state="visible", timeout=3000)
+    except Exception:
+        wait_for_settle(page, 350)
+
+
+def wait_for_results_ready(page: Page):
+    # Wait for likely results containers/cards so searches/card transitions settle faster.
+    try:
+        page.locator("[role='main']").first.wait_for(state="visible", timeout=7000)
+        cards = page.locator("[role='main'] [role='listitem'], [role='main'] li, main [role='listitem'], main li")
+        cards.first.wait_for(state="visible", timeout=5000)
+    except Exception:
+        wait_for_settle(page, 500)
+
+
+def wait_for_dialog_to_close(page: Page):
+    # Date/passenger overlays often use dialog semantics; wait until they close.
+    try:
+        page.locator("[role='dialog']").first.wait_for(state="hidden", timeout=2500)
+    except Exception:
+        wait_for_settle(page, 350)
+
+
 def screenshot(page: Page, name: str):
     if not CONFIG.save_failure_screenshots:
         return
@@ -314,7 +341,7 @@ def install_common_handlers(page: Page):
 def open_google_flights(page: Page):
     log("[step] opening Google Flights")
     page.goto(URL, wait_until="domcontentloaded")
-    wait_for_settle(page, 2500)
+    wait_for_page_ready(page)
 
     # Occasionally "unsupported" interstitial appears in certain browser configs.
     # Try to click "Proceed anyway" if present.
@@ -322,7 +349,7 @@ def open_google_flights(page: Page):
         btn = page.get_by_role("button", name=re.compile(r"Proceed anyway", re.I))
         if btn.count() > 0:
             try_click(btn.first, 3000)
-            wait_for_settle(page, 2000)
+            wait_for_page_ready(page)
     except Exception:
         pass
 
@@ -330,7 +357,7 @@ def open_google_flights(page: Page):
         link = page.get_by_text(re.compile(r"Proceed anyway", re.I))
         if link.count() > 0:
             try_click(link.first, 3000)
-            wait_for_settle(page, 2000)
+            wait_for_page_ready(page)
     except Exception:
         pass
 
@@ -692,7 +719,7 @@ def close_date_picker(page: Page):
     for _ in range(2):
         try:
             page.keyboard.press("Escape")
-            wait_for_settle(page, 300)
+            wait_for_dialog_to_close(page)
         except Exception:
             pass
 
@@ -701,7 +728,7 @@ def close_date_picker(page: Page):
         try:
             btn = page.get_by_role("button", name=re.compile(rf"^{label}$", re.I))
             if btn.count() > 0 and try_click(btn.first, 1000):
-                wait_for_settle(page, 500)
+                wait_for_dialog_to_close(page)
                 return
         except Exception:
             pass
@@ -730,7 +757,7 @@ def set_dates(page: Page, depart: date, ret: date):
 
         wait_for_settle(page, 600)
     close_date_picker(page)
-    wait_for_settle(page, 1200)
+    wait_for_dialog_to_close(page)
 
 
 def click_search_or_refresh(page: Page):
@@ -740,13 +767,13 @@ def click_search_or_refresh(page: Page):
             btn = page.get_by_role("button", name=re.compile(pat, re.I))
             vis = first_visible(btn)
             if vis and try_click(vis, 1500):
-                wait_for_settle(page, 2000)
+                wait_for_results_ready(page)
                 return
         except Exception:
             pass
 
     # Fallback: short wait for auto-refresh
-    wait_for_settle(page, 2500)
+    wait_for_results_ready(page)
 
 
 def click_cheapest_tab_if_present(page: Page):
@@ -960,7 +987,7 @@ def click_card_by_text(page: Page, raw_text: str) -> bool:
                 hits += 1
         if hits >= max(1, min(2, len(anchors))):
             if try_click(el, 2000):
-                wait_for_settle(page, 1800)
+                wait_for_results_ready(page)
                 return True
 
     return False
@@ -990,11 +1017,13 @@ def extract_total_price_from_page(page: Page) -> Tuple[Optional[int], Optional[s
 def back_one(page: Page):
     try:
         page.go_back(wait_until="domcontentloaded")
-        wait_for_settle(page, 1800)
+        wait_for_page_ready(page)
+        wait_for_results_ready(page)
     except Exception:
         try:
             page.keyboard.press("Alt+Left")
-            wait_for_settle(page, 1800)
+            wait_for_page_ready(page)
+            wait_for_results_ready(page)
         except Exception:
             pass
 
@@ -1059,7 +1088,7 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
         if not click_card_by_text(page, ob.raw_text):
             continue
 
-        wait_for_settle(page, 2200)
+        wait_for_results_ready(page)
 
         # Phase 2: return results
         return_cards = collect_flight_cards(page, "return", CONFIG.max_return_cards_to_try)
@@ -1077,7 +1106,7 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
             if not click_card_by_text(page, rb.raw_text):
                 continue
 
-            wait_for_settle(page, 2500)
+            wait_for_results_ready(page)
             total_value, total_text = extract_total_price_from_page(page)
 
             current = RoundTripResult(
@@ -1108,7 +1137,7 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
 
             # After selecting return, go back to return choices for another candidate.
             back_one(page)
-            wait_for_settle(page, 1200)
+            wait_for_results_ready(page)
 
             # If we got one success, that's often enough for a first pass.
             if best_result is not None:
@@ -1116,7 +1145,7 @@ def search_combo_and_pick_best(page: Page, depart: date, ret: date) -> RoundTrip
 
         # Go back to outbound result list
         back_one(page)
-        wait_for_settle(page, 1800)
+        wait_for_results_ready(page)
 
         if best_result is not None:
             break
@@ -1308,7 +1337,7 @@ def main():
                             dump_html(page, f"timeout_oneway_{depart}_attempt{attempt}")
                             try:
                                 page.goto(URL, wait_until="domcontentloaded")
-                                wait_for_settle(page, 2500)
+                                wait_for_page_ready(page)
                                 ensure_trip_mode(page, CONFIG.round_trip)
                                 set_origin_destination(page, CONFIG.origin, CONFIG.destination)
                                 set_passengers(page, CONFIG.passengers)
@@ -1320,7 +1349,7 @@ def main():
                             dump_html(page, f"combo_error_oneway_{depart}_attempt{attempt}")
                             try:
                                 page.goto(URL, wait_until="domcontentloaded")
-                                wait_for_settle(page, 2500)
+                                wait_for_page_ready(page)
                                 ensure_trip_mode(page, CONFIG.round_trip)
                                 set_origin_destination(page, CONFIG.origin, CONFIG.destination)
                                 set_passengers(page, CONFIG.passengers)
@@ -1371,7 +1400,7 @@ def main():
                                 dump_html(page, f"timeout_{depart}_{ret}_attempt{attempt}")
                                 try:
                                     page.goto(URL, wait_until="domcontentloaded")
-                                    wait_for_settle(page, 2500)
+                                    wait_for_page_ready(page)
                                     ensure_trip_mode(page, CONFIG.round_trip)
                                     set_origin_destination(page, CONFIG.origin, CONFIG.destination)
                                     set_passengers(page, CONFIG.passengers)
@@ -1383,7 +1412,7 @@ def main():
                                 dump_html(page, f"combo_error_{depart}_{ret}_attempt{attempt}")
                                 try:
                                     page.goto(URL, wait_until="domcontentloaded")
-                                    wait_for_settle(page, 2500)
+                                    wait_for_page_ready(page)
                                     ensure_trip_mode(page, CONFIG.round_trip)
                                     set_origin_destination(page, CONFIG.origin, CONFIG.destination)
                                     set_passengers(page, CONFIG.passengers)
