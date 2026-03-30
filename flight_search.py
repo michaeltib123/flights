@@ -197,18 +197,17 @@ def arrival_is_valid(depart_t: Optional[dtime], arrive_t: Optional[dtime]) -> bo
     if CONFIG.latest_arrival_time is None:
         return True
 
-    depart_mins = depart_t.hour * 60 + depart_t.minute
-    arrive_mins = arrive_t.hour * 60 + arrive_t.minute
-    latest_mins = (
+    depart_minutes = depart_t.hour * 60 + depart_t.minute
+    arrive_minutes = arrive_t.hour * 60 + arrive_t.minute
+    latest_arrival_minutes = (
         CONFIG.latest_arrival_time.hour * 60
         + CONFIG.latest_arrival_time.minute
     )
 
-    # Normalize overnight arrivals to next day before cutoff comparison.
-    if arrive_mins < depart_mins:
-        arrive_mins += 24 * 60
+    if arrive_minutes < depart_minutes:
+        arrive_minutes += 24 * 60
 
-    return arrive_mins <= latest_mins
+    return arrive_minutes <= latest_arrival_minutes
 
 
 def daterange(start: date, end: date):
